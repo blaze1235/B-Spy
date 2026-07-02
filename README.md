@@ -9,25 +9,24 @@ requires Telegram Business/Premium). Once connected, it:
   you, showing the text *before* and *after*.
 - **Tracks deletes** — notifies you when someone deletes a message they
   sent you, with the last known content (and any saved media).
-- **Tries to save incoming photos/videos** as they arrive, including
-  "view once" ones, and tells you when it worked.
+- **Saves media on demand** — reply to any photo/video someone sent you
+  (even a single emoji as the reply) and the bot downloads and sends it
+  back to you. Nothing is saved automatically; only what you reply to.
 
 All notifications arrive as normal messages from the bot in your own chat
 with it — no separate channel needed.
 
-## Important limitation: self-destructing/view-once media
+## Why "reply to save" instead of automatic
 
-Telegram's self-destruct feature is designed so the media is only ever
-readable by the client that opens it — that's the whole point of it. In
-practice this Business Bot mechanism is very likely to be blocked by
-Telegram from downloading that content at all (unlike edits/deletes, which
-are officially exposed to bots). The bot **attempts** the download every
-time and tells you plainly if it failed, so you can verify this yourself
-rather than take my word for it. If reliable self-destruct capture turns
-out to matter to you and this doesn't work, the only way to get it is a
-real logged-in user session (a "userbot," e.g. via Telethon) — happy to
-build that alongside this if you want it, just say so. Regular (non
-self-destructing) photos/videos are saved reliably.
+The Bot API gives bots no way to tell a self-destructing/view-once photo
+apart from a regular one — there's no field for it, by design (that's the
+whole point of self-destruct). So automatically saving "only the expiring
+ones" isn't something a bot can actually do. Auto-saving everything would
+mean hoarding ordinary photos you never asked to keep. Replying to a
+specific message sidesteps the problem entirely: you decide what's worth
+keeping, and the bot fetches it right then - before you might otherwise
+open/view it and lose it for good. If a reply fails to save something, the
+bot tells you (most likely it already expired or was viewed).
 
 ## Setup
 
