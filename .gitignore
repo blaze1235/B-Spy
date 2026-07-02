@@ -1,0 +1,8 @@
+.env
+saved_media/
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc
+*.session
