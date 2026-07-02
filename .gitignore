@@ -5,4 +5,3 @@ saved_media/
 *.db-shm
 __pycache__/
 *.pyc
-*.session
