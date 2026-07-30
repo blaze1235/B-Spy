@@ -47,4 +47,4 @@ def update_plan(connection_id):
 
 
 def run():
-    app.run(host="0.0.0.0", port=config.PORT)
+    app.run(host="0.0.0.0", port=config.PORT, threaded=True)
