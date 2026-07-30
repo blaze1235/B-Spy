@@ -1,6 +1,7 @@
 import hmac
 
 from flask import Flask, Response, redirect, render_template, request
+from waitress import serve
 
 import config
 import db
@@ -47,4 +48,4 @@ def update_plan(connection_id):
 
 
 def run():
-    app.run(host="0.0.0.0", port=config.PORT, threaded=True)
+    serve(app, host="0.0.0.0", port=config.PORT, threads=16)
