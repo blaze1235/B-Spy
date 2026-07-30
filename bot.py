@@ -1,7 +1,6 @@
 import html
 import logging
 import os
-import threading
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -257,11 +256,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     db.init_db()
-
-    import admin
-
-    threading.Thread(target=admin.run, daemon=True).start()
-    log.info("Admin panel listening on port %s", config.PORT)
 
     app = Application.builder().token(config.BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
