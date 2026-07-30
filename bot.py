@@ -1,6 +1,8 @@
 import html
 import logging
 import os
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -13,6 +15,29 @@ logging.basicConfig(level=config.LOG_LEVEL, format="%(asctime)s [%(levelname)s] 
 log = logging.getLogger("secretary")
 
 os.makedirs(config.MEDIA_DIR, exist_ok=True)
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, format, *args):
+        pass  # don't spam the bot's logs with health-check hits
+
+
+class _HealthServer(ThreadingHTTPServer):
+    request_queue_size = 128
+    daemon_threads = True
+
+
+def start_health_server():
+    """Minimal stdlib-only HTTP server so Railway has something to see on
+    $PORT. No Flask/waitress here on purpose - this must never be the thing
+    that breaks."""
+    server = _HealthServer(("0.0.0.0", config.PORT), _HealthHandler)
+    server.serve_forever()
 
 
 def chat_title_of(chat):
@@ -256,6 +281,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     db.init_db()
+
+    threading.Thread(target=start_health_server, daemon=True).start()
+    log.info("Health endpoint listening on port %s", config.PORT)
 
     app = Application.builder().token(config.BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
