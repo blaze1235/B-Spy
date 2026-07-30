@@ -9,6 +9,12 @@ _conn = sqlite3.connect(config.DB_PATH, check_same_thread=False)
 _conn.execute("PRAGMA journal_mode=WAL")
 
 
+def _ensure_column(table, column, coltype_with_default):
+    cols = [row[1] for row in _conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if column not in cols:
+        _conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype_with_default}")
+
+
 def init_db():
     with _lock, _conn:
         _conn.execute(
@@ -52,21 +58,33 @@ def init_db():
             )
             """
         )
+        # Columns added after the initial release - kept as migrations so an
+        # already-running deployment's data doesn't need to be wiped.
+        _ensure_column("connections", "owner_username", "TEXT")
+        _ensure_column("connections", "owner_first_name", "TEXT")
+        _ensure_column("connections", "plan", "TEXT DEFAULT 'free'")
+        _ensure_column("connections", "first_connected_at", "TEXT")
 
 
-def upsert_connection(connection_id, owner_user_id, owner_chat_id, is_enabled):
+def upsert_connection(connection_id, owner_user_id, owner_chat_id, is_enabled, owner_username=None, owner_first_name=None):
+    now = datetime.now(timezone.utc).isoformat()
     with _lock, _conn:
         _conn.execute(
             """
-            INSERT INTO connections (connection_id, owner_user_id, owner_chat_id, is_enabled, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO connections (
+                connection_id, owner_user_id, owner_chat_id, is_enabled,
+                owner_username, owner_first_name, updated_at, first_connected_at, plan
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'free')
             ON CONFLICT(connection_id) DO UPDATE SET
                 owner_user_id=excluded.owner_user_id,
                 owner_chat_id=excluded.owner_chat_id,
                 is_enabled=excluded.is_enabled,
+                owner_username=excluded.owner_username,
+                owner_first_name=excluded.owner_first_name,
                 updated_at=excluded.updated_at
             """,
-            (connection_id, owner_user_id, owner_chat_id, int(is_enabled), datetime.now(timezone.utc).isoformat()),
+            (connection_id, owner_user_id, owner_chat_id, int(is_enabled), owner_username, owner_first_name, now, now),
         )
 
 
@@ -77,6 +95,55 @@ def get_connection(connection_id):
         if not row:
             return None
         cols = [d[0] for d in cur.description]
+        return dict(zip(cols, row))
+
+
+def set_plan(connection_id, plan):
+    with _lock, _conn:
+        _conn.execute("UPDATE connections SET plan=? WHERE connection_id=?", (plan, connection_id))
+
+
+def list_connections_with_stats():
+    """One row per connected user, with usage counts, for the admin dashboard."""
+    with _lock:
+        cur = _conn.execute(
+            """
+            SELECT
+                c.connection_id,
+                c.owner_user_id,
+                c.owner_chat_id,
+                c.owner_username,
+                c.owner_first_name,
+                c.is_enabled,
+                c.plan,
+                c.first_connected_at,
+                c.updated_at,
+                (SELECT COUNT(*) FROM messages m WHERE m.connection_id = c.connection_id) AS message_count,
+                (SELECT COUNT(*) FROM edit_history e WHERE e.connection_id = c.connection_id) AS edit_count,
+                (SELECT COUNT(*) FROM messages m WHERE m.connection_id = c.connection_id AND m.deleted = 1) AS delete_count,
+                (SELECT COUNT(*) FROM messages m WHERE m.connection_id = c.connection_id AND m.media_path IS NOT NULL) AS media_count
+            FROM connections c
+            ORDER BY c.first_connected_at DESC
+            """
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def get_totals():
+    with _lock:
+        row = _conn.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM connections) AS total_users,
+                (SELECT COUNT(*) FROM connections WHERE is_enabled = 1) AS active_users,
+                (SELECT COUNT(*) FROM messages) AS total_messages,
+                (SELECT COUNT(*) FROM edit_history) AS total_edits,
+                (SELECT COUNT(*) FROM messages WHERE deleted = 1) AS total_deletes,
+                (SELECT COUNT(*) FROM messages WHERE media_path IS NOT NULL) AS total_media
+            """
+        ).fetchone()
+        cols = ["total_users", "active_users", "total_messages", "total_edits", "total_deletes", "total_media"]
         return dict(zip(cols, row))
 
 

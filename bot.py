@@ -1,6 +1,7 @@
 import html
 import logging
 import os
+import threading
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -66,7 +67,14 @@ async def notify(context: ContextTypes.DEFAULT_TYPE, owner_chat_id, text, media_
 
 async def on_business_connection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = update.business_connection
-    db.upsert_connection(conn.id, conn.user.id, conn.user_chat_id, conn.is_enabled)
+    db.upsert_connection(
+        conn.id,
+        conn.user.id,
+        conn.user_chat_id,
+        conn.is_enabled,
+        owner_username=conn.user.username,
+        owner_first_name=conn.user.first_name,
+    )
     if conn.is_enabled:
         text = (
             "🤝 <b>Secretary bot connected</b>\n\n"
@@ -249,6 +257,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     db.init_db()
+
+    import admin
+
+    threading.Thread(target=admin.run, daemon=True).start()
+    log.info("Admin panel listening on port %s", config.PORT)
+
     app = Application.builder().token(config.BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(TypeHandler(Update, route_update))

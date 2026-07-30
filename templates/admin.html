@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>B-Spy Admin</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; background: #0b0d12; color: #e6e8eb; }
+  h1 { font-size: 1.4rem; margin-bottom: 1.2rem; }
+  .totals { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .card { background: #151822; border: 1px solid #262b3a; border-radius: 10px; padding: 0.9rem 1.2rem; min-width: 110px; }
+  .card .n { font-size: 1.5rem; font-weight: 700; }
+  .card .l { font-size: 0.75rem; color: #9aa2b1; text-transform: uppercase; letter-spacing: 0.04em; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.88rem; }
+  th, td { text-align: left; padding: 0.55rem 0.7rem; border-bottom: 1px solid #262b3a; }
+  th { color: #9aa2b1; font-weight: 600; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 0.04em; }
+  tr:hover { background: #12141c; }
+  .status { display: inline-block; width: 0.55rem; height: 0.55rem; border-radius: 50%; margin-right: 0.4rem; }
+  .status.active { background: #3ecf8e; }
+  .status.inactive { background: #666; }
+  select, button { background: #1c202b; color: #e6e8eb; border: 1px solid #333a4d; border-radius: 6px; padding: 0.3rem 0.5rem; font-size: 0.82rem; }
+  button { cursor: pointer; }
+  form.plan-form { display: flex; gap: 0.4rem; }
+  .muted { color: #9aa2b1; }
+  .empty { color: #9aa2b1; padding: 2rem 0; text-align: center; }
+</style>
+</head>
+<body>
+  <h1>B-Spy — user tracking</h1>
+
+  <div class="totals">
+    <div class="card"><div class="n">{{ totals.total_users }}</div><div class="l">Connected users</div></div>
+    <div class="card"><div class="n">{{ totals.active_users }}</div><div class="l">Active now</div></div>
+    <div class="card"><div class="n">{{ totals.total_messages }}</div><div class="l">Messages tracked</div></div>
+    <div class="card"><div class="n">{{ totals.total_edits }}</div><div class="l">Edits caught</div></div>
+    <div class="card"><div class="n">{{ totals.total_deletes }}</div><div class="l">Deletes caught</div></div>
+    <div class="card"><div class="n">{{ totals.total_media }}</div><div class="l">Media saved</div></div>
+  </div>
+
+  {% if users %}
+  <table>
+    <thead>
+      <tr>
+        <th>User</th>
+        <th>Status</th>
+        <th>Connected since</th>
+        <th>Plan</th>
+        <th>Messages</th>
+        <th>Edits</th>
+        <th>Deletes</th>
+        <th>Media</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for u in users %}
+      <tr>
+        <td>
+          {% if u.owner_username %}@{{ u.owner_username }}{% else %}{{ u.owner_first_name or "Unknown" }}{% endif %}
+          <div class="muted">id {{ u.owner_user_id }}</div>
+        </td>
+        <td>
+          <span class="status {{ 'active' if u.is_enabled else 'inactive' }}"></span>
+          {{ "Active" if u.is_enabled else "Disconnected" }}
+        </td>
+        <td>{{ u.first_connected_at[:10] if u.first_connected_at else "-" }}</td>
+        <td>
+          <form class="plan-form" method="post" action="/admin/plan/{{ u.connection_id }}">
+            <select name="plan">
+              {% for p in plan_options %}
+              <option value="{{ p }}" {{ "selected" if p == u.plan else "" }}>{{ p }}</option>
+              {% endfor %}
+            </select>
+            <button type="submit">Save</button>
+          </form>
+        </td>
+        <td>{{ u.message_count }}</td>
+        <td>{{ u.edit_count }}</td>
+        <td>{{ u.delete_count }}</td>
+        <td>{{ u.media_count }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">No one has connected the bot yet.</div>
+  {% endif %}
+</body>
+</html>
