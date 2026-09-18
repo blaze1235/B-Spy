@@ -64,6 +64,7 @@ def init_db():
         _ensure_column("connections", "owner_first_name", "TEXT")
         _ensure_column("connections", "plan", "TEXT DEFAULT 'free'")
         _ensure_column("connections", "first_connected_at", "TEXT")
+        _ensure_column("messages", "sender_username", "TEXT")
 
 
 def upsert_connection(connection_id, owner_user_id, owner_chat_id, is_enabled, owner_username=None, owner_first_name=None):
@@ -147,18 +148,28 @@ def get_totals():
         return dict(zip(cols, row))
 
 
-def upsert_message(connection_id, chat_id, msg_id, sender_id, sender_name, chat_title, text, media_type, media_path, date):
+def upsert_message(
+    connection_id, chat_id, msg_id, sender_id, sender_name, chat_title, text, media_type, media_path, date,
+    sender_username=None,
+):
     with _lock, _conn:
         _conn.execute(
             """
-            INSERT INTO messages (connection_id, chat_id, msg_id, sender_id, sender_name, chat_title, text, media_type, media_path, date, deleted)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            INSERT INTO messages (
+                connection_id, chat_id, msg_id, sender_id, sender_name, sender_username,
+                chat_title, text, media_type, media_path, date, deleted
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
             ON CONFLICT(connection_id, chat_id, msg_id) DO UPDATE SET
                 text=excluded.text,
                 media_type=COALESCE(excluded.media_type, messages.media_type),
-                media_path=COALESCE(excluded.media_path, messages.media_path)
+                media_path=COALESCE(excluded.media_path, messages.media_path),
+                sender_username=COALESCE(excluded.sender_username, messages.sender_username)
             """,
-            (connection_id, chat_id, msg_id, sender_id, sender_name, chat_title, text, media_type, media_path, date),
+            (
+                connection_id, chat_id, msg_id, sender_id, sender_name, sender_username,
+                chat_title, text, media_type, media_path, date,
+            ),
         )
 
 

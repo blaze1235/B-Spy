@@ -50,8 +50,35 @@ def sender_name_of(user):
     return user.username or " ".join(filter(None, [user.first_name, user.last_name])) or "Unknown"
 
 
+def sender_username_of(user):
+    return user.username if user else None
+
+
 def esc(text):
     return html.escape(text or "")
+
+
+def build_user_link(user_id, username, display_name):
+    """A clickable link to a Telegram account. Prefers the public
+    https://t.me/<username> link (works for anyone, in-app or on the web).
+    Falls back to a tg://user?id=... deep link when there's no username -
+    that only resolves inside Telegram itself, and Telegram may still refuse
+    to open it depending on the account's privacy settings; that's a
+    Telegram-side limit, not something a bot can override."""
+    name = esc(display_name or "Unknown")
+    if username:
+        url = f"https://t.me/{username}"
+    elif user_id:
+        url = f"tg://user?id={user_id}"
+    else:
+        return name
+    return f'<a href="{url}">{name}</a>'
+
+
+def user_link(user):
+    if not user:
+        return "Unknown"
+    return build_user_link(user.id, user.username, sender_name_of(user))
 
 
 def media_kind_of(message):
@@ -103,8 +130,8 @@ async def on_business_connection(update: Update, context: ContextTypes.DEFAULT_T
         text = (
             "🤝 <b>Secretary bot connected</b>\n\n"
             "Here's what I'll do from now on:\n"
-            "✏️ Tell you when someone edits a message they sent you\n"
-            "🗑 Tell you when someone deletes a message they sent you\n"
+            "✏️ Tell you when someone edits a message they sent you, with a link to their account\n"
+            "🗑 Tell you when someone deletes a message they sent you, with a link to their account\n"
             "💾 Save a photo/video if you <i>reply</i> to it - just reply with anything "
             "(even a single emoji) to the media you want kept"
         )
@@ -125,7 +152,7 @@ async def save_replied_media(context: ContextTypes.DEFAULT_TYPE, conn, message):
     if not file_id:
         return  # replied to something with no photo/video, nothing to do
 
-    sender_name = sender_name_of(replied.from_user)
+    link = user_link(replied.from_user)
     chat_title = chat_title_of(message.chat)
 
     try:
@@ -138,7 +165,7 @@ async def save_replied_media(context: ContextTypes.DEFAULT_TYPE, conn, message):
         await notify(
             context,
             conn["owner_chat_id"],
-            f"⚠️ Couldn't save that {esc(media_type)} from <b>{esc(sender_name)}</b> - "
+            f"⚠️ Couldn't save that {esc(media_type)} from {link} - "
             "it may have already expired or been opened.",
         )
         return
@@ -148,7 +175,8 @@ async def save_replied_media(context: ContextTypes.DEFAULT_TYPE, conn, message):
         chat_id=message.chat.id,
         msg_id=replied.message_id,
         sender_id=replied.from_user.id if replied.from_user else None,
-        sender_name=sender_name,
+        sender_name=sender_name_of(replied.from_user),
+        sender_username=sender_username_of(replied.from_user),
         chat_title=chat_title,
         text=replied.caption or "",
         media_type=media_type,
@@ -160,7 +188,7 @@ async def save_replied_media(context: ContextTypes.DEFAULT_TYPE, conn, message):
     await notify(
         context,
         conn["owner_chat_id"],
-        f"{emoji} <b>Saved</b> - {esc(media_type)} from <b>{esc(sender_name)}</b> in <i>{esc(chat_title)}</i>",
+        f"{emoji} <b>Saved</b> - {esc(media_type)} from {link} in <i>{esc(chat_title)}</i>",
         media_path=path,
     )
 
@@ -180,7 +208,6 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return  # don't track the owner's own messages for edit/delete diffing
 
     text = message.text or message.caption or ""
-    sender_name = sender_name_of(message.from_user)
     chat_title = chat_title_of(message.chat)
 
     db.upsert_message(
@@ -188,7 +215,8 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         chat_id=message.chat.id,
         msg_id=message.message_id,
         sender_id=message.from_user.id if message.from_user else None,
-        sender_name=sender_name,
+        sender_name=sender_name_of(message.from_user),
+        sender_username=sender_username_of(message.from_user),
         chat_title=chat_title,
         text=text,
         media_type=media_kind_of(message),
@@ -209,15 +237,15 @@ async def on_business_message_edited(update: Update, context: ContextTypes.DEFAU
     old = db.get_message(conn_id, message.chat.id, message.message_id)
     new_text = message.text or message.caption or ""
     old_text = old["text"] if old else None
-    sender_name = old["sender_name"] if old else sender_name_of(message.from_user)
     chat_title = old["chat_title"] if old else chat_title_of(message.chat)
+    link = user_link(message.from_user)
 
     if old_text is not None and old_text != new_text:
         db.add_edit_history(conn_id, message.chat.id, message.message_id, old_text, new_text)
         await notify(
             context,
             conn["owner_chat_id"],
-            f"✏️ <b>Message edited</b> - <b>{esc(sender_name)}</b> in <i>{esc(chat_title)}</i>\n\n"
+            f"✏️ <b>Message edited</b> - {link} in <i>{esc(chat_title)}</i>\n\n"
             f"<b>Before:</b>\n{esc(old_text) or '<i>(empty)</i>'}\n\n"
             f"<b>After:</b>\n{esc(new_text) or '<i>(empty)</i>'}",
         )
@@ -227,7 +255,8 @@ async def on_business_message_edited(update: Update, context: ContextTypes.DEFAU
         chat_id=message.chat.id,
         msg_id=message.message_id,
         sender_id=message.from_user.id if message.from_user else None,
-        sender_name=sender_name,
+        sender_name=sender_name_of(message.from_user),
+        sender_username=sender_username_of(message.from_user),
         chat_title=chat_title,
         text=new_text,
         media_type=None,
@@ -248,8 +277,9 @@ async def on_business_messages_deleted(update: Update, context: ContextTypes.DEF
         if not row or row["deleted"]:
             continue
         db.mark_deleted(conn_id, deleted.chat.id, msg_id)
+        link = build_user_link(row["sender_id"], row.get("sender_username"), row["sender_name"])
         text = (
-            f"🗑 <b>Message deleted</b> - <b>{esc(row['sender_name'])}</b> in <i>{esc(row['chat_title'])}</i>\n\n"
+            f"🗑 <b>Message deleted</b> - {link} in <i>{esc(row['chat_title'])}</i>\n\n"
             f"{esc(row['text']) or '<i>(no text)</i>'}"
         )
         media_path = row["media_path"] if row["media_path"] and os.path.exists(row["media_path"]) else None
@@ -274,7 +304,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "(requires Telegram Business/Premium)\n"
         "2. Add this bot and turn on the permissions you want\n\n"
         "Then I'll message you here whenever someone edits or deletes a message they sent you, "
-        "and I'll save a photo/video whenever you reply to it.",
+        "with a link to their account, and I'll save a photo/video whenever you reply to it.",
         parse_mode=ParseMode.HTML,
     )
 
