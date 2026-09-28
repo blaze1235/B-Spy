@@ -16,6 +16,15 @@ log = logging.getLogger("secretary")
 
 os.makedirs(config.MEDIA_DIR, exist_ok=True)
 
+MEDIA_EMOJI = {
+    "photo": "📸",
+    "video": "🎥",
+    "video note": "🎥",
+    "voice": "🎤",
+    "audio": "🎵",
+    "document": "📄",
+}
+
 
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -81,35 +90,71 @@ def user_link(user):
     return build_user_link(user.id, user.username, sender_name_of(user))
 
 
-def media_kind_of(message):
-    """Media type present on a message, without downloading anything."""
-    if message.photo:
-        return "photo"
-    if message.video:
-        return "video"
-    if message.video_note:
-        return "video"
-    return None
-
-
 def extract_file_id(message):
+    """(media_type, file_id) for the richest media on a message, or (None, None)."""
     if message.photo:
         return "photo", message.photo[-1].file_id
     if message.video:
         return "video", message.video.file_id
     if message.video_note:
-        return "video", message.video_note.file_id
+        return "video note", message.video_note.file_id
+    if message.voice:
+        return "voice", message.voice.file_id
+    if message.audio:
+        return "audio", message.audio.file_id
+    if message.document:
+        return "document", message.document.file_id
     return None, None
 
 
-async def notify(context: ContextTypes.DEFAULT_TYPE, owner_chat_id, text, media_path=None):
+def guess_ext(media_type, message):
+    if media_type == "photo":
+        return ".jpg"
+    if media_type in ("video", "video note"):
+        return ".mp4"
+    if media_type == "voice":
+        return ".ogg"
+    if media_type == "audio":
+        name = message.audio.file_name if message.audio else None
+        return os.path.splitext(name)[1] if name else ".mp3"
+    if media_type == "document":
+        name = message.document.file_name if message.document else None
+        return os.path.splitext(name)[1] if name else ".bin"
+    return ""
+
+
+async def try_download_media(context: ContextTypes.DEFAULT_TYPE, message, chat_id):
+    """Best-effort silent download of any media on a message. Returns
+    (media_type, media_path) - media_path is None if there was no media, or
+    if the download failed (e.g. a self-destructing photo already viewed)."""
+    media_type, file_id = extract_file_id(message)
+    if not file_id:
+        return media_type, None
+    try:
+        tg_file = await context.bot.get_file(file_id)
+        ext = guess_ext(media_type, message)
+        path = os.path.join(config.MEDIA_DIR, f"{chat_id}_{message.message_id}{ext}")
+        await tg_file.download_to_drive(path)
+        return media_type, path
+    except Exception:
+        log.warning("Could not download %s for message %s", media_type, message.message_id)
+        return media_type, None
+
+
+async def notify(context: ContextTypes.DEFAULT_TYPE, owner_chat_id, text, media_path=None, media_type=None):
     try:
         if media_path and os.path.exists(media_path):
             with open(media_path, "rb") as f:
-                if media_path.lower().endswith((".mp4", ".mov", ".mkv")):
-                    await context.bot.send_video(owner_chat_id, video=f, caption=text, parse_mode=ParseMode.HTML)
-                else:
+                if media_type == "photo":
                     await context.bot.send_photo(owner_chat_id, photo=f, caption=text, parse_mode=ParseMode.HTML)
+                elif media_type in ("video", "video note"):
+                    await context.bot.send_video(owner_chat_id, video=f, caption=text, parse_mode=ParseMode.HTML)
+                elif media_type == "voice":
+                    await context.bot.send_voice(owner_chat_id, voice=f, caption=text, parse_mode=ParseMode.HTML)
+                elif media_type == "audio":
+                    await context.bot.send_audio(owner_chat_id, audio=f, caption=text, parse_mode=ParseMode.HTML)
+                else:
+                    await context.bot.send_document(owner_chat_id, document=f, caption=text, parse_mode=ParseMode.HTML)
         else:
             await context.bot.send_message(owner_chat_id, text, parse_mode=ParseMode.HTML)
     except Exception:
@@ -131,9 +176,10 @@ async def on_business_connection(update: Update, context: ContextTypes.DEFAULT_T
             "🤝 <b>Secretary bot connected</b>\n\n"
             "Here's what I'll do from now on:\n"
             "✏️ Tell you when someone edits a message they sent you, with a link to their account\n"
-            "🗑 Tell you when someone deletes a message they sent you, with a link to their account\n"
-            "💾 Save a photo/video if you <i>reply</i> to it - just reply with anything "
-            "(even a single emoji) to the media you want kept"
+            "🗑 Tell you when someone deletes a message they sent you, with a link to their account - "
+            "including the photo/video/voice/audio if I managed to save it\n"
+            "💾 Photos, videos and voice/audio messages are saved automatically as they arrive, "
+            "so they're recoverable if deleted later"
         )
     else:
         text = "🔌 <b>Secretary bot disconnected.</b> I won't see your messages until you reconnect me."
@@ -144,24 +190,20 @@ async def on_business_connection(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def save_replied_media(context: ContextTypes.DEFAULT_TYPE, conn, message):
+    """Manual fallback: reply to a message to (re)try saving its media,
+    e.g. if the automatic save on arrival failed for some reason."""
     replied = message.reply_to_message
     if not replied or (replied.from_user and replied.from_user.id == conn["owner_user_id"]):
         return  # only save media other people sent, not the owner's own
 
-    media_type, file_id = extract_file_id(replied)
-    if not file_id:
-        return  # replied to something with no photo/video, nothing to do
+    media_type, media_path = await try_download_media(context, replied, message.chat.id)
+    if not media_type:
+        return  # replied to something with no media, nothing to do
 
     link = user_link(replied.from_user)
     chat_title = chat_title_of(message.chat)
 
-    try:
-        tg_file = await context.bot.get_file(file_id)
-        ext = ".mp4" if media_type == "video" else ".jpg"
-        path = os.path.join(config.MEDIA_DIR, f"{message.chat.id}_{replied.message_id}{ext}")
-        await tg_file.download_to_drive(path)
-    except Exception:
-        log.warning("Could not download replied-to media for message %s", replied.message_id)
+    if not media_path:
         await notify(
             context,
             conn["owner_chat_id"],
@@ -180,16 +222,17 @@ async def save_replied_media(context: ContextTypes.DEFAULT_TYPE, conn, message):
         chat_title=chat_title,
         text=replied.caption or "",
         media_type=media_type,
-        media_path=path,
+        media_path=media_path,
         date=replied.date.isoformat(),
     )
 
-    emoji = "📸" if media_type == "photo" else "🎥"
+    emoji = MEDIA_EMOJI.get(media_type, "💾")
     await notify(
         context,
         conn["owner_chat_id"],
         f"{emoji} <b>Saved</b> - {esc(media_type)} from {link} in <i>{esc(chat_title)}</i>",
-        media_path=path,
+        media_path=media_path,
+        media_type=media_type,
     )
 
 
@@ -210,6 +253,12 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = message.text or message.caption or ""
     chat_title = chat_title_of(message.chat)
 
+    # Grab photos/videos/voice/audio the moment they arrive, silently, so
+    # they're recoverable later if the message gets deleted. Best-effort:
+    # if it's already gone (e.g. a self-destructing photo) this just fails
+    # quietly and the delete notification will say what it was, unsaved.
+    media_type, media_path = await try_download_media(context, message, message.chat.id)
+
     db.upsert_message(
         connection_id=conn_id,
         chat_id=message.chat.id,
@@ -219,8 +268,8 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         sender_username=sender_username_of(message.from_user),
         chat_title=chat_title,
         text=text,
-        media_type=media_kind_of(message),
-        media_path=None,
+        media_type=media_type,
+        media_path=media_path,
         date=message.date.isoformat(),
     )
 
@@ -259,8 +308,8 @@ async def on_business_message_edited(update: Update, context: ContextTypes.DEFAU
         sender_username=sender_username_of(message.from_user),
         chat_title=chat_title,
         text=new_text,
-        media_type=None,
-        media_path=None,
+        media_type=old["media_type"] if old else None,
+        media_path=old["media_path"] if old else None,
         date=message.date.isoformat(),
     )
 
@@ -278,12 +327,18 @@ async def on_business_messages_deleted(update: Update, context: ContextTypes.DEF
             continue
         db.mark_deleted(conn_id, deleted.chat.id, msg_id)
         link = build_user_link(row["sender_id"], row.get("sender_username"), row["sender_name"])
-        text = (
-            f"🗑 <b>Message deleted</b> - {link} in <i>{esc(row['chat_title'])}</i>\n\n"
-            f"{esc(row['text']) or '<i>(no text)</i>'}"
-        )
+
         media_path = row["media_path"] if row["media_path"] and os.path.exists(row["media_path"]) else None
-        await notify(context, conn["owner_chat_id"], text, media_path=media_path)
+        if row["text"]:
+            body = esc(row["text"])
+        elif row["media_type"]:
+            saved_note = "" if media_path else " - couldn't save it in time"
+            body = f"<i>[{esc(row['media_type'])}{saved_note}]</i>"
+        else:
+            body = "<i>(no text)</i>"
+
+        text = f"🗑 <b>Message deleted</b> - {link} in <i>{esc(row['chat_title'])}</i>\n\n{body}"
+        await notify(context, conn["owner_chat_id"], text, media_path=media_path, media_type=row["media_type"])
 
 
 async def route_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -304,7 +359,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "(requires Telegram Business/Premium)\n"
         "2. Add this bot and turn on the permissions you want\n\n"
         "Then I'll message you here whenever someone edits or deletes a message they sent you, "
-        "with a link to their account, and I'll save a photo/video whenever you reply to it.",
+        "with a link to their account. Photos, videos and voice/audio messages are saved "
+        "automatically as they arrive, so they're recoverable if deleted later.",
         parse_mode=ParseMode.HTML,
     )
 
