@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, TypeHandler
 
 import config
@@ -474,6 +475,18 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 
+async def safe_edit(query, text, keyboard):
+    """Edit the message, ignoring Telegram's 'message is not modified' error.
+
+    Tapping Refresh/Back when nothing changed sends an identical edit, which
+    Telegram rejects with a 400 - harmless, but it crashed the handler."""
+    try:
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    except BadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            raise
+
+
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not is_admin(query.from_user):
@@ -485,7 +498,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "al":
         text, keyboard = admin_list_view()
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        await safe_edit(query, text, keyboard)
         await query.answer()
         return
 
@@ -493,19 +506,19 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not row:
         await query.answer("That user no longer exists.", show_alert=True)
         text, keyboard = admin_list_view()
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        await safe_edit(query, text, keyboard)
         return
 
     if action == "av":
         text, keyboard = admin_detail_view(row)
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        await safe_edit(query, text, keyboard)
         await query.answer()
 
     elif action == "at":
         db.set_user_blocked(row["owner_user_id"], not row["blocked"])
         row = db.get_connection_with_stats(row["rid"])
         text, keyboard = admin_detail_view(row)
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        await safe_edit(query, text, keyboard)
         await query.answer("Restricted" if row["blocked"] else "Unrestricted")
 
     elif action == "ar":
@@ -513,19 +526,19 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⚠️ Yes, remove", callback_data=f"arc:{row['rid']}")],
             [InlineKeyboardButton("Cancel", callback_data=f"av:{row['rid']}")],
         ])
-        await query.edit_message_text(
+        await safe_edit(
+            query,
             f"Remove <b>{esc(admin_display_name(row))}</b> and delete all their stored messages and media?\n\n"
             "This can't be undone. If they reconnect the bot later they'll start fresh - "
             "use <b>Restrict</b> instead if you want to keep them out.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
+            keyboard,
         )
         await query.answer()
 
     elif action == "arc":
         db.delete_connection(row["connection_id"])
         text, keyboard = admin_list_view()
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        await safe_edit(query, text, keyboard)
         await query.answer("Removed")
 
     else:
