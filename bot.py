@@ -4,9 +4,9 @@ import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes, TypeHandler
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, TypeHandler
 
 import config
 import db
@@ -161,6 +161,14 @@ async def notify(context: ContextTypes.DEFAULT_TYPE, owner_chat_id, text, media_
         log.exception("Failed to notify owner")
 
 
+def active_connection(conn_id):
+    """The connection row if it exists and its owner isn't blocked, else None."""
+    conn = db.get_connection(conn_id)
+    if not conn or conn["blocked"]:
+        return None
+    return conn
+
+
 async def on_business_connection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = update.business_connection
     db.upsert_connection(
@@ -171,6 +179,9 @@ async def on_business_connection(update: Update, context: ContextTypes.DEFAULT_T
         owner_username=conn.user.username,
         owner_first_name=conn.user.first_name,
     )
+    if db.is_user_blocked(conn.user.id):
+        return  # recorded so the admin can see them, but they get nothing
+
     if conn.is_enabled:
         text = (
             "🤝 <b>Secretary bot connected</b>\n\n"
@@ -239,9 +250,9 @@ async def save_replied_media(context: ContextTypes.DEFAULT_TYPE, conn, message):
 async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.business_message
     conn_id = message.business_connection_id
-    conn = db.get_connection(conn_id)
+    conn = active_connection(conn_id)
     if not conn:
-        return  # bot restarted and hasn't seen a business_connection update yet
+        return  # unknown connection, or owner is blocked
 
     is_owner = message.from_user and message.from_user.id == conn["owner_user_id"]
 
@@ -277,7 +288,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def on_business_message_edited(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.edited_business_message
     conn_id = message.business_connection_id
-    conn = db.get_connection(conn_id)
+    conn = active_connection(conn_id)
     if not conn:
         return
     if message.from_user and message.from_user.id == conn["owner_user_id"]:
@@ -317,7 +328,7 @@ async def on_business_message_edited(update: Update, context: ContextTypes.DEFAU
 async def on_business_messages_deleted(update: Update, context: ContextTypes.DEFAULT_TYPE):
     deleted = update.deleted_business_messages
     conn_id = deleted.business_connection_id
-    conn = db.get_connection(conn_id)
+    conn = active_connection(conn_id)
     if not conn:
         return
 
@@ -365,6 +376,142 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ---------------------------------------------------------------- admin ----
+
+def is_admin(user):
+    return bool(user) and user.id in config.ADMIN_TELEGRAM_IDS
+
+
+def admin_display_name(row):
+    if row["owner_username"]:
+        return f"@{row['owner_username']}"
+    return row["owner_first_name"] or f"id {row['owner_user_id']}"
+
+
+def admin_status(row):
+    if row["blocked"]:
+        return "🚫", "restricted"
+    if row["is_enabled"]:
+        return "✅", "active"
+    return "⏸", "disconnected"
+
+
+def admin_list_view():
+    rows = db.list_connections_with_stats()
+    totals = db.get_totals()
+    text = (
+        "👑 <b>Admin panel</b>\n\n"
+        f"👥 Users: <b>{totals['total_users']}</b> (active {totals['active_users']})\n"
+        f"💬 Messages tracked: {totals['total_messages']}\n"
+        f"✏️ Edits: {totals['total_edits']} · 🗑 Deletes: {totals['total_deletes']} · "
+        f"💾 Media: {totals['total_media']}\n\n"
+    )
+    if not rows:
+        text += "No one has connected the bot yet."
+        return text, InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data="al")]])
+
+    text += "Tap a user to manage them:"
+    buttons = []
+    for row in rows:
+        emoji, _ = admin_status(row)
+        label = f"{emoji} {admin_display_name(row)} · {row['message_count']} msgs"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"av:{row['rid']}")])
+    buttons.append([InlineKeyboardButton("🔄 Refresh", callback_data="al")])
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def admin_detail_view(row):
+    emoji, status = admin_status(row)
+    profile = build_user_link(row["owner_user_id"], row["owner_username"], admin_display_name(row))
+    text = (
+        f"👤 {profile}\n"
+        f"🆔 <code>{row['owner_user_id']}</code>\n"
+        f"Status: {emoji} {status}\n"
+        f"Connected since: {esc((row['first_connected_at'] or '-')[:10])}\n\n"
+        f"💬 Messages tracked: {row['message_count']}\n"
+        f"✏️ Edits caught: {row['edit_count']}\n"
+        f"🗑 Deletes caught: {row['delete_count']}\n"
+        f"💾 Media saved: {row['media_count']}"
+    )
+    rid = row["rid"]
+    toggle = (
+        InlineKeyboardButton("✅ Unrestrict", callback_data=f"at:{rid}")
+        if row["blocked"]
+        else InlineKeyboardButton("🚫 Restrict", callback_data=f"at:{rid}")
+    )
+    keyboard = InlineKeyboardMarkup([
+        [toggle],
+        [InlineKeyboardButton("🗑 Remove", callback_data=f"ar:{rid}")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="al")],
+    ])
+    return text, keyboard
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user):
+        return
+    text, keyboard = admin_list_view()
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_admin(query.from_user):
+        await query.answer()
+        return
+
+    data = query.data or ""
+    action, _, arg = data.partition(":")
+
+    if action == "al":
+        text, keyboard = admin_list_view()
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        await query.answer()
+        return
+
+    row = db.get_connection_with_stats(int(arg)) if arg.isdigit() else None
+    if not row:
+        await query.answer("That user no longer exists.", show_alert=True)
+        text, keyboard = admin_list_view()
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        return
+
+    if action == "av":
+        text, keyboard = admin_detail_view(row)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        await query.answer()
+
+    elif action == "at":
+        db.set_user_blocked(row["owner_user_id"], not row["blocked"])
+        row = db.get_connection_with_stats(row["rid"])
+        text, keyboard = admin_detail_view(row)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        await query.answer("Restricted" if row["blocked"] else "Unrestricted")
+
+    elif action == "ar":
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚠️ Yes, remove", callback_data=f"arc:{row['rid']}")],
+            [InlineKeyboardButton("Cancel", callback_data=f"av:{row['rid']}")],
+        ])
+        await query.edit_message_text(
+            f"Remove <b>{esc(admin_display_name(row))}</b> and delete all their stored messages and media?\n\n"
+            "This can't be undone. If they reconnect the bot later they'll start fresh - "
+            "use <b>Restrict</b> instead if you want to keep them out.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+        await query.answer()
+
+    elif action == "arc":
+        db.delete_connection(row["connection_id"])
+        text, keyboard = admin_list_view()
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        await query.answer("Removed")
+
+    else:
+        await query.answer()
+
+
 def main():
     db.init_db()
 
@@ -373,6 +520,10 @@ def main():
 
     app = Application.builder().token(config.BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CallbackQueryHandler(admin_callback))
+    # Must stay last: it matches every update, and only the first matching
+    # handler in a group runs.
     app.add_handler(TypeHandler(Update, route_update))
     log.info("Secretary bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

@@ -58,6 +58,17 @@ def init_db():
             )
             """
         )
+        # Keyed by owner_user_id (not connection_id) so a block survives the
+        # person disconnecting and reconnecting the bot, which issues a new
+        # connection_id each time.
+        _conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS blocked_users (
+                owner_user_id INTEGER PRIMARY KEY,
+                blocked_at TEXT
+            )
+            """
+        )
         # Columns added after the initial release - kept as migrations so an
         # already-running deployment's data doesn't need to be wiped.
         _ensure_column("connections", "owner_username", "TEXT")
@@ -96,7 +107,9 @@ def get_connection(connection_id):
         if not row:
             return None
         cols = [d[0] for d in cur.description]
-        return dict(zip(cols, row))
+        result = dict(zip(cols, row))
+    result["blocked"] = is_user_blocked(result["owner_user_id"])
+    return result
 
 
 def set_plan(connection_id, plan):
@@ -104,31 +117,45 @@ def set_plan(connection_id, plan):
         _conn.execute("UPDATE connections SET plan=? WHERE connection_id=?", (plan, connection_id))
 
 
+_STATS_SELECT = """
+    SELECT
+        c.rowid AS rid,
+        c.connection_id,
+        c.owner_user_id,
+        c.owner_chat_id,
+        c.owner_username,
+        c.owner_first_name,
+        c.is_enabled,
+        c.plan,
+        c.first_connected_at,
+        c.updated_at,
+        EXISTS(SELECT 1 FROM blocked_users b WHERE b.owner_user_id = c.owner_user_id) AS blocked,
+        (SELECT COUNT(*) FROM messages m WHERE m.connection_id = c.connection_id) AS message_count,
+        (SELECT COUNT(*) FROM edit_history e WHERE e.connection_id = c.connection_id) AS edit_count,
+        (SELECT COUNT(*) FROM messages m WHERE m.connection_id = c.connection_id AND m.deleted = 1) AS delete_count,
+        (SELECT COUNT(*) FROM messages m WHERE m.connection_id = c.connection_id AND m.media_path IS NOT NULL) AS media_count
+    FROM connections c
+"""
+
+
 def list_connections_with_stats():
-    """One row per connected user, with usage counts, for the admin dashboard."""
+    """One row per connected user, with usage counts, for the admin panel."""
     with _lock:
-        cur = _conn.execute(
-            """
-            SELECT
-                c.connection_id,
-                c.owner_user_id,
-                c.owner_chat_id,
-                c.owner_username,
-                c.owner_first_name,
-                c.is_enabled,
-                c.plan,
-                c.first_connected_at,
-                c.updated_at,
-                (SELECT COUNT(*) FROM messages m WHERE m.connection_id = c.connection_id) AS message_count,
-                (SELECT COUNT(*) FROM edit_history e WHERE e.connection_id = c.connection_id) AS edit_count,
-                (SELECT COUNT(*) FROM messages m WHERE m.connection_id = c.connection_id AND m.deleted = 1) AS delete_count,
-                (SELECT COUNT(*) FROM messages m WHERE m.connection_id = c.connection_id AND m.media_path IS NOT NULL) AS media_count
-            FROM connections c
-            ORDER BY c.first_connected_at DESC
-            """
-        )
+        cur = _conn.execute(_STATS_SELECT + " ORDER BY c.first_connected_at DESC")
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def get_connection_with_stats(rid):
+    """Look up by SQLite rowid - short enough to fit in Telegram's 64-byte
+    button callback_data, unlike connection_id."""
+    with _lock:
+        cur = _conn.execute(_STATS_SELECT + " WHERE c.rowid=?", (rid,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        cols = [d[0] for d in cur.description]
+        return dict(zip(cols, row))
 
 
 def get_totals():
@@ -146,6 +173,34 @@ def get_totals():
         ).fetchone()
         cols = ["total_users", "active_users", "total_messages", "total_edits", "total_deletes", "total_media"]
         return dict(zip(cols, row))
+
+
+def is_user_blocked(owner_user_id):
+    with _lock:
+        cur = _conn.execute("SELECT 1 FROM blocked_users WHERE owner_user_id=?", (owner_user_id,))
+        return cur.fetchone() is not None
+
+
+def set_user_blocked(owner_user_id, blocked):
+    with _lock, _conn:
+        if blocked:
+            _conn.execute(
+                "INSERT INTO blocked_users (owner_user_id, blocked_at) VALUES (?, ?) "
+                "ON CONFLICT(owner_user_id) DO NOTHING",
+                (owner_user_id, datetime.now(timezone.utc).isoformat()),
+            )
+        else:
+            _conn.execute("DELETE FROM blocked_users WHERE owner_user_id=?", (owner_user_id,))
+
+
+def delete_connection(connection_id):
+    """Purge a connection's stored data (messages, edit history, the
+    connection record itself). Does not affect any block - use
+    set_user_blocked for that."""
+    with _lock, _conn:
+        _conn.execute("DELETE FROM messages WHERE connection_id=?", (connection_id,))
+        _conn.execute("DELETE FROM edit_history WHERE connection_id=?", (connection_id,))
+        _conn.execute("DELETE FROM connections WHERE connection_id=?", (connection_id,))
 
 
 def upsert_message(
