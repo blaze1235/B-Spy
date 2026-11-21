@@ -161,9 +161,29 @@ async def notify(context: ContextTypes.DEFAULT_TYPE, owner_chat_id, text, media_
         log.exception("Failed to notify owner")
 
 
-def active_connection(conn_id):
-    """The connection row if it exists and its owner isn't blocked, else None."""
+async def active_connection(context: ContextTypes.DEFAULT_TYPE, conn_id):
+    """The connection row if its owner isn't blocked, else None.
+
+    If we've never seen this connection (e.g. the database was wiped by a
+    redeploy), ask Telegram for it instead of silently ignoring the user
+    until they reconnect the bot."""
     conn = db.get_connection(conn_id)
+    if not conn:
+        try:
+            bc = await context.bot.get_business_connection(conn_id)
+        except Exception:
+            log.exception("Could not fetch business connection %s", conn_id)
+            return None
+        db.upsert_connection(
+            bc.id,
+            bc.user.id,
+            bc.user_chat_id,
+            bc.is_enabled,
+            owner_username=bc.user.username,
+            owner_first_name=bc.user.first_name,
+        )
+        log.info("Recovered unknown business connection for user %s", bc.user.id)
+        conn = db.get_connection(conn_id)
     if not conn or conn["blocked"]:
         return None
     return conn
@@ -250,7 +270,7 @@ async def save_replied_media(context: ContextTypes.DEFAULT_TYPE, conn, message):
 async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.business_message
     conn_id = message.business_connection_id
-    conn = active_connection(conn_id)
+    conn = await active_connection(context, conn_id)
     if not conn:
         return  # unknown connection, or owner is blocked
 
@@ -288,7 +308,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def on_business_message_edited(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.edited_business_message
     conn_id = message.business_connection_id
-    conn = active_connection(conn_id)
+    conn = await active_connection(context, conn_id)
     if not conn:
         return
     if message.from_user and message.from_user.id == conn["owner_user_id"]:
@@ -328,7 +348,7 @@ async def on_business_message_edited(update: Update, context: ContextTypes.DEFAU
 async def on_business_messages_deleted(update: Update, context: ContextTypes.DEFAULT_TYPE):
     deleted = update.deleted_business_messages
     conn_id = deleted.business_connection_id
-    conn = active_connection(conn_id)
+    conn = await active_connection(context, conn_id)
     if not conn:
         return
 
