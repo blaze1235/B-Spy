@@ -462,10 +462,99 @@ def admin_detail_view(row):
     )
     keyboard = InlineKeyboardMarkup([
         [toggle],
+        [InlineKeyboardButton("🧹 Wipe a person's messages from chat", callback_data=f"dl:{rid}")],
         [InlineKeyboardButton("🗑 Remove", callback_data=f"ar:{rid}")],
         [InlineKeyboardButton("⬅️ Back", callback_data="al")],
     ])
     return text, keyboard
+
+
+def sender_label(s):
+    if s["sender_username"]:
+        name = f"@{s['sender_username']}"
+    else:
+        name = s["sender_name"] or f"id {s['sender_id']}"
+    return f"{name} · {s['cnt']} msgs"
+
+
+def admin_sender_list_view(owner):
+    senders = db.list_senders(owner["connection_id"])
+    owner_name = esc(admin_display_name(owner))
+    if not senders:
+        text = (
+            f"🧹 <b>Wipe messages in {owner_name}'s chats</b>\n\n"
+            "No tracked people with messages still in the chat. I can only "
+            "delete messages I recorded while running."
+        )
+        return text, InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data=f"av:{owner['rid']}")]])
+
+    text = (
+        f"🧹 <b>Wipe messages in {owner_name}'s chats</b>\n\n"
+        "Pick the person whose messages you want to delete from "
+        f"{owner_name}'s real Telegram chat. This removes them for both sides, permanently."
+    )
+    buttons = [
+        [InlineKeyboardButton(sender_label(s), callback_data=f"dp:{owner['rid']}:{s['sender_id']}")]
+        for s in senders[:50]
+    ]
+    buttons.append([InlineKeyboardButton("⬅️ Back", callback_data=f"av:{owner['rid']}")])
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def admin_delete_confirm_view(owner, sender_id):
+    s = db.get_sender_summary(owner["connection_id"], sender_id)
+    if s["sender_username"]:
+        who = f"@{esc(s['sender_username'])}"
+    else:
+        who = esc(s["sender_name"] or f"id {sender_id}")
+    text = (
+        f"⚠️ Delete <b>{s['cnt']}</b> message(s) from <b>{who}</b> out of "
+        f"<b>{esc(admin_display_name(owner))}</b>'s real Telegram chat?\n\n"
+        "They disappear for <b>both people</b> and can't be brought back. This needs the "
+        "<i>delete messages</i> permission to be on for the bot in that account's "
+        "Telegram Business → Chatbots settings; anything I can't delete I'll report back."
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"⚠️ Yes, delete {s['cnt']}", callback_data=f"dc:{owner['rid']}:{sender_id}")],
+        [InlineKeyboardButton("Cancel", callback_data=f"dl:{owner['rid']}")],
+    ])
+    return text, keyboard
+
+
+async def delete_sender_from_chat(context, owner, sender_id):
+    """Delete all of one person's still-live messages from the owner's real
+    Telegram chat, in batches of 100 per chat. Returns (deleted, failed)."""
+    conn_id = owner["connection_id"]
+    rows = db.get_sender_live_messages(conn_id, sender_id)
+    by_chat = {}
+    for r in rows:
+        by_chat.setdefault(r["chat_id"], []).append(r)
+
+    deleted = failed = 0
+    media_root = os.path.abspath(config.MEDIA_DIR) + os.sep
+    for chat_id, batch_rows in by_chat.items():
+        for i in range(0, len(batch_rows), 100):
+            chunk = batch_rows[i:i + 100]
+            ids = [r["msg_id"] for r in chunk]
+            # Mark purged first so the delete update Telegram echoes back
+            # doesn't fire a "message deleted" notification to the owner.
+            db.set_messages_deleted_state(conn_id, chat_id, ids, 2)
+            try:
+                await context.bot.delete_business_messages(business_connection_id=conn_id, message_ids=ids)
+            except Exception:
+                log.exception("delete_business_messages failed (%s msgs, chat %s)", len(ids), chat_id)
+                db.set_messages_deleted_state(conn_id, chat_id, ids, 0)  # revert, keep retryable
+                failed += len(ids)
+                continue
+            deleted += len(ids)
+            for r in chunk:
+                p = r["media_path"]
+                if p and os.path.abspath(p).startswith(media_root) and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+    return deleted, failed
 
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -502,7 +591,12 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         return
 
-    row = db.get_connection_with_stats(int(arg)) if arg.isdigit() else None
+    # Everything else targets one owner, identified by their rowid (the first
+    # arg). Delete actions carry a second arg: the sender's user id.
+    parts = arg.split(":")
+    rid_str = parts[0]
+    sender_id = int(parts[1]) if len(parts) > 1 and parts[1].lstrip("-").isdigit() else None
+    row = db.get_connection_with_stats(int(rid_str)) if rid_str.isdigit() else None
     if not row:
         await query.answer("That user no longer exists.", show_alert=True)
         text, keyboard = admin_list_view()
@@ -513,6 +607,36 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, keyboard = admin_detail_view(row)
         await safe_edit(query, text, keyboard)
         await query.answer()
+
+    elif action == "dl":
+        text, keyboard = admin_sender_list_view(row)
+        await safe_edit(query, text, keyboard)
+        await query.answer()
+
+    elif action == "dp" and sender_id is not None:
+        text, keyboard = admin_delete_confirm_view(row, sender_id)
+        await safe_edit(query, text, keyboard)
+        await query.answer()
+
+    elif action == "dc" and sender_id is not None:
+        await query.answer("Deleting…")
+        deleted, failed = await delete_sender_from_chat(context, row, sender_id)
+        if failed and not deleted:
+            result = (
+                f"❌ Couldn't delete any of the {failed} message(s). The bot most likely "
+                "doesn't have the <i>delete messages</i> permission in that account's "
+                "Telegram Business → Chatbots settings, or the messages are too old for Telegram to remove."
+            )
+        elif failed:
+            result = f"✅ Deleted {deleted} message(s). ⚠️ {failed} couldn't be deleted (too old, or permission off)."
+        elif deleted:
+            result = f"✅ Deleted {deleted} message(s) from the chat."
+        else:
+            result = "Nothing left to delete - those messages were already gone."
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Back to user", callback_data=f"av:{row['rid']}")],
+        ])
+        await safe_edit(query, result, keyboard)
 
     elif action == "at":
         db.set_user_blocked(row["owner_user_id"], not row["blocked"])
