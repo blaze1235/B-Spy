@@ -203,6 +203,75 @@ def delete_connection(connection_id):
         _conn.execute("DELETE FROM connections WHERE connection_id=?", (connection_id,))
 
 
+# deleted column values:
+#   0 = live (still in the real chat, as far as we know)
+#   1 = the sender deleted it (what the bot was built to catch)
+#   2 = the admin deleted it from the real chat via this panel
+# Both 1 and 2 count as "gone", so the re-notify guard (if row["deleted"])
+# skips them; only 1 is counted as a "delete caught" in the stats.
+
+def list_senders(connection_id):
+    """People who messaged this owner and still have live messages, most
+    messages first. Bare sender_name/username come from the newest message
+    thanks to SQLite's single-MAX() bare-column rule."""
+    with _lock:
+        cur = _conn.execute(
+            """
+            SELECT sender_id,
+                   COUNT(*) AS cnt,
+                   sender_name,
+                   sender_username,
+                   MAX(date) AS newest
+            FROM messages
+            WHERE connection_id=? AND sender_id IS NOT NULL AND deleted=0
+            GROUP BY sender_id
+            ORDER BY cnt DESC, newest DESC
+            """,
+            (connection_id,),
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def get_sender_summary(connection_id, sender_id):
+    with _lock:
+        cur = _conn.execute(
+            """
+            SELECT COUNT(*) AS cnt, sender_name, sender_username, MAX(date) AS newest
+            FROM messages
+            WHERE connection_id=? AND sender_id=? AND deleted=0
+            """,
+            (connection_id, sender_id),
+        )
+        row = cur.fetchone()
+        cols = [d[0] for d in cur.description]
+        return dict(zip(cols, row))
+
+
+def get_sender_live_messages(connection_id, sender_id):
+    """Live (deleted=0) messages from this sender - the ones we can still
+    ask Telegram to delete."""
+    with _lock:
+        cur = _conn.execute(
+            "SELECT chat_id, msg_id, media_path FROM messages "
+            "WHERE connection_id=? AND sender_id=? AND deleted=0",
+            (connection_id, sender_id),
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def set_messages_deleted_state(connection_id, chat_id, msg_ids, state):
+    if not msg_ids:
+        return
+    placeholders = ",".join("?" for _ in msg_ids)
+    with _lock, _conn:
+        _conn.execute(
+            f"UPDATE messages SET deleted=? WHERE connection_id=? AND chat_id=? AND msg_id IN ({placeholders})",
+            [state, connection_id, chat_id, *msg_ids],
+        )
+
+
 def upsert_message(
     connection_id, chat_id, msg_id, sender_id, sender_name, chat_title, text, media_type, media_path, date,
     sender_username=None,
